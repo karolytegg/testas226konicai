@@ -30,12 +30,12 @@ jobs:
           mkdir -p work/inputs work/project work/scripts reports
           python3 - <<'PY'
           import os, pathlib, shutil, hashlib, json
-          source = pathlib.Path('samples')
+          source = pathlib.Path('.')
           if os.environ['SELF_TEST'] == 'true':
               shutil.copyfile('/bin/true', 'work/inputs/self-test.elf')
           else:
               allowed = {'ar226.ds', 'arwt.dll', 'wsd226.dll', 'arg.dll', 'arge.dll', 'argmon.dll', 'argppr.dll', 'setupscan.dll'}
-              for p in source.rglob('*') if source.exists() else []:
+              for p in source.glob('*') if source.exists() else []:
                   if p.is_file() and not p.is_symlink() and p.name.lower() in allowed:
                       if p.stat().st_size > 20 * 1024 * 1024:
                           raise SystemExit('Input too large')
@@ -45,7 +45,7 @@ jobs:
                       shutil.copyfile(p, dest)
           files = sorted(pathlib.Path('work/inputs').iterdir())
           if not files:
-              raise SystemExit('No driver inputs. Add authorized binaries under samples/ or use self_test.')
+              raise SystemExit('No driver inputs. Add authorized binaries in repository root or use self_test.')
           manifest = [{'name': p.name, 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in files]
           pathlib.Path('reports/manifest.json').write_text(json.dumps(manifest, indent=2))
           PY
