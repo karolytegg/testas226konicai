@@ -1,0 +1,123 @@
+name: Static driver analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      self_test:
+        description: 'Test Ghidra with the runner system binary (no driver needed)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare inputs
+        env:
+          SELF_TEST: ${{ inputs.self_test }}
+        run: |
+          mkdir -p work/inputs work/project work/scripts reports
+          python3 - <<'PY'
+          import os, pathlib, shutil, hashlib, json
+          source = pathlib.Path('samples')
+          if os.environ['SELF_TEST'] == 'true':
+              shutil.copyfile('/bin/true', 'work/inputs/self-test.elf')
+          else:
+              allowed = {'ar226.ds', 'arwt.dll', 'wsd226.dll', 'arg.dll', 'arge.dll', 'argmon.dll', 'argppr.dll', 'setupscan.dll'}
+              for p in source.rglob('*') if source.exists() else []:
+                  if p.is_file() and not p.is_symlink() and p.name.lower() in allowed:
+                      if p.stat().st_size > 20 * 1024 * 1024:
+                          raise SystemExit('Input too large')
+                      dest = pathlib.Path('work/inputs') / p.name.lower()
+                      if dest.exists():
+                          raise SystemExit('Duplicate input name')
+                      shutil.copyfile(p, dest)
+          files = sorted(pathlib.Path('work/inputs').iterdir())
+          if not files:
+              raise SystemExit('No driver inputs. Add authorized binaries under samples/ or use self_test.')
+          manifest = [{'name': p.name, 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in files]
+          pathlib.Path('reports/manifest.json').write_text(json.dumps(manifest, indent=2))
+          PY
+      - name: Download and verify Ghidra 11.3.2
+        run: |
+          python3 - <<'PY'
+          import urllib.request, json, hashlib, zipfile, pathlib
+          api = 'https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_11.3.2_build'
+          req = urllib.request.Request(api, headers={'User-Agent': 'driver-static-analysis'})
+          release = json.load(urllib.request.urlopen(req, timeout=60))
+          asset = next(a for a in release['assets'] if a['name'].endswith('.zip'))
+          urllib.request.urlretrieve(asset['browser_download_url'], 'work/ghidra.zip')
+          with open('work/ghidra.zip', 'rb') as f:
+              digest = hashlib.file_digest(f, 'sha256').hexdigest()
+          if digest != '99d45035bdcc3d6627e7b1232b7b379905a9fad76c772c920602e2b5d8b2dac2':
+              raise SystemExit('Ghidra checksum mismatch')
+          with zipfile.ZipFile('work/ghidra.zip') as z:
+              z.extractall('work/engine')
+              for item in z.infolist():
+                  mode = item.external_attr >> 16
+                  if mode & 0o111:
+                      pathlib.Path('work/engine', item.filename).chmod(mode & 0o777)
+          PY
+      - name: Create export script
+        run: |
+          cat > work/scripts/ExportAnalysis.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.app.decompiler.*;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.symbol.*;
+          import java.io.*;
+          public class ExportAnalysis extends GhidraScript {
+            public void run() throws Exception {
+              File folder = new File(getScriptArgs()[0], currentProgram.getName());
+              folder.mkdirs();
+              DecompInterface decompiler = new DecompInterface();
+              try {
+                if (!decompiler.openProgram(currentProgram)) throw new IOException("Cannot open program");
+                try (PrintWriter code = new PrintWriter(new File(folder, "decompiled.c"));
+                     PrintWriter symbols = new PrintWriter(new File(folder, "symbols.tsv"))) {
+                  code.println("/* Analysis pseudocode only: not original source or a working driver. */");
+                  SymbolIterator si = currentProgram.getSymbolTable().getAllSymbols(true);
+                  while(si.hasNext() && !monitor.isCancelled()) {
+                    Symbol s = si.next(); symbols.println(s.getAddress()+"\t"+s.getSymbolType()+"\t"+s.getName(true));
+                  }
+                  FunctionIterator fi = currentProgram.getFunctionManager().getFunctions(true);
+                  while(fi.hasNext() && !monitor.isCancelled()) {
+                    Function f = fi.next();
+                    code.println("\n/* "+f.getEntryPoint()+" "+f.getName()+" */");
+                    DecompileResults r = decompiler.decompileFunction(f, 30, monitor);
+                    if(r.decompileCompleted() && r.getDecompiledFunction()!=null) code.println(r.getDecompiledFunction().getC());
+                    else code.println("/* DECOMPILATION FAILED: "+r.getErrorMessage()+" */");
+                  }
+                }
+              } finally { decompiler.dispose(); }
+            }
+          }
+          JAVA
+      - name: Analyze without executing driver binaries
+        run: |
+          engine=$(find work/engine -type f -name analyzeHeadless -print -quit)
+          test -n "$engine"
+          for binary in work/inputs/*; do
+            "$engine" "$PWD/work/project" Drivers -import "$PWD/$binary" \
+              -scriptPath "$PWD/work/scripts" -postScript ExportAnalysis.java "$PWD/reports" \
+              -analysisTimeoutPerFile 300 -max-cpu 2 -deleteProject
+          done
+      - name: Save reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-${{ github.run_id }}
+          path: reports/
+          retention-days: 7
+          if-no-files-found: error
